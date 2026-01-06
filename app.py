@@ -295,7 +295,7 @@ for col, k in zip([c1, c2, c3, c4], ["Y", "P", "OI", "M"]):
 st.divider()
 
 st.subheader("实时行情")
-st.dataframe(df, use_container_width=True, hide_index=True)
+st.dataframe(df, width="stretch", hide_index=True)
 
 # 更新单品种价格历史（用于突破信号）
 for k, sym in symbols_map.items():
