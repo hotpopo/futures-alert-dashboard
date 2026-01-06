@@ -21,8 +21,8 @@ TZ_CST = timezone(timedelta(hours=8))   # 交易时段判断：中国时间
 SINA_QUOTE_URL = "https://hq.sinajs.cn/list="
 
 CONTRACT_GROUPS = {
-    "2605": {"Y": "Y2605", "P": "P2605", "OI": "OI2605", "M": "M2605"},
-    "2609": {"Y": "Y2609", "P": "P2609", "OI": "OI2609", "M": "M2609"},
+    "2605": {"Y": "y2605", "P": "p2605", "OI": "oi2605", "M": "m2605"},
+    "2609": {"Y": "y2609", "P": "p2609", "OI": "oi2609", "M": "m2609"},
 }
 
 HEADERS = {
