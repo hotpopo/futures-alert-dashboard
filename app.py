@@ -15,18 +15,16 @@ from streamlit_autorefresh import st_autorefresh
 # ---------------------------
 st.set_page_config(page_title="期货实时提示看板", layout="wide")
 
-TZ_JST = timezone(timedelta(hours=9))  # 你在日本，界面显示用 JST
-TZ_CST = timezone(timedelta(hours=8))  # 交易时段判断用中国时间 CST
+TZ_JST = timezone(timedelta(hours=9))   # 页面显示：日本时间
+TZ_CST = timezone(timedelta(hours=8))   # 交易时段判断：中国时间
 
-SINA_QUOTE_URL = "https://hq.sinajs.cn/list="  # 多个用逗号拼接
+SINA_QUOTE_URL = "https://hq.sinajs.cn/list="
 
-# 固定合约：2605 / 2609
 CONTRACT_GROUPS = {
     "2605": {"Y": "Y2605", "P": "P2605", "OI": "OI2605", "M": "M2605"},
     "2609": {"Y": "Y2609", "P": "P2609", "OI": "OI2609", "M": "M2609"},
 }
 
-# 为了尽量避免 403，带上常见 headers（新浪接口有时会校验来源/UA）
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36",
     "Referer": "https://finance.sina.com.cn/",
@@ -35,36 +33,26 @@ HEADERS = {
 
 
 # ---------------------------
-# 交易时段判断（DCE 常见：日盘 + 夜盘）
-# 注意：不同合约/节假日会变，这里做“安全保守版”
-# - 周一到周五
-# - 日盘：09:00-11:30, 13:30-15:00
-# - 夜盘：21:00-23:00（保守写到23:00；有些品种到23:00/23:30/01:00）
-# 你可以后续再精细化到具体品种
+# 交易时段判断（保守版：日盘 + 夜盘 21:00-23:00）
 # ---------------------------
 def is_trading_time_cst(dt_cst: datetime) -> bool:
-    # 周末直接 false
     if dt_cst.weekday() >= 5:
         return False
 
     hm = dt_cst.hour * 60 + dt_cst.minute
 
-    def in_range(start_hm, end_hm):
-        return start_hm <= hm <= end_hm
+    def in_range(a, b):
+        return a <= hm <= b
 
-    # 日盘
     day_1 = in_range(9 * 60, 11 * 60 + 30)
     day_2 = in_range(13 * 60 + 30, 15 * 60)
-
-    # 夜盘（保守：21:00-23:00）
     night = in_range(21 * 60, 23 * 60)
 
     return day_1 or day_2 or night
 
 
 # ---------------------------
-# 取行情：Sina hq.sinajs.cn
-# 返回格式类似：var hq_str_Y2605="豆油2605,....";
+# 行情
 # ---------------------------
 def fetch_sina_quotes(symbols: list[str]) -> dict:
     if not symbols:
@@ -92,36 +80,17 @@ def parse_common(fields: list[str]) -> dict:
             return float("nan")
 
     name = fields[0] if len(fields) > 0 else ""
-
     open_ = fnum(fields[2]) if len(fields) > 2 else float("nan")
     high = fnum(fields[3]) if len(fields) > 3 else float("nan")
     low = fnum(fields[4]) if len(fields) > 4 else float("nan")
     last = fnum(fields[5]) if len(fields) > 5 else float("nan")
 
-    volume = float("nan")
-    oi = float("nan")
-    for idx in [12, 13, 14, 15]:
-        if len(fields) > idx and (volume != volume):
-            volume = fnum(fields[idx])
-        if len(fields) > idx + 1 and (oi != oi):
-            oi = fnum(fields[idx + 1])
+    return {"name": name, "open": open_, "high": high, "low": low, "last": last}
 
-    dt_text = ""
-    if len(fields) >= 2:
-        tail = fields[-2:]
-        if re.match(r"\d{4}-\d{2}-\d{2}", tail[0]):
-            dt_text = " ".join(tail)
 
-    return {
-        "name": name,
-        "open": open_,
-        "high": high,
-        "low": low,
-        "last": last,
-        "volume": volume,
-        "oi": oi,
-        "dt_text": dt_text,
-    }
+@st.cache_data(ttl=5, show_spinner=False)
+def fetch_sina_quotes_cached(symbols: tuple[str, ...]) -> dict:
+    return fetch_sina_quotes(list(symbols))
 
 
 def zscore_from_list(values: list[float]) -> float:
@@ -137,12 +106,83 @@ def zscore_from_list(values: list[float]) -> float:
 
 
 # ---------------------------
-# 缓存：限制访问频率（关键：避免一直刷新浪）
-# ttl_seconds 内多次调用只会真的请求一次
+# 突破确认信号（模板1）
 # ---------------------------
-@st.cache_data(ttl=5, show_spinner=False)
-def fetch_sina_quotes_cached(symbols: tuple[str, ...]) -> dict:
-    return fetch_sina_quotes(list(symbols))
+def atr_proxy_from_prices(prices: list[float], lookback: int) -> float:
+    """没有OHLC时，用 |ΔP| 的均值近似波动（保守替代 ATR）"""
+    arr = np.array(prices, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if len(arr) < lookback + 2:
+        return float("nan")
+    diffs = np.abs(np.diff(arr[-(lookback + 1):]))
+    if len(diffs) == 0:
+        return float("nan")
+    return float(np.mean(diffs))
+
+
+def breakout_signal(
+    prices: deque,
+    window: int,
+    confirm_k: int,
+    buffer: float,
+    atr_lookback: int,
+    atr_mult_stop: float,
+    rr_take: float,
+):
+    """
+    返回：
+    - direction: "LONG"/"SHORT"/None
+    - entry, stop, tp
+    - level: 突破的参考位（上沿/下沿）
+    - info: 文本解释
+    """
+    series = [p for p in list(prices) if np.isfinite(p)]
+    if len(series) < window + confirm_k + 5:
+        return None, None, None, None, None, "样本不足（开盘后需要累积一段数据）"
+
+    # 用“过去window个点”作为区间，不包含最近confirm_k个点，以免自我引用
+    base = series[: -(confirm_k)]
+    recent = series[-confirm_k:]
+
+    if len(base) < window:
+        return None, None, None, None, None, "样本不足（base不足）"
+
+    base_window = base[-window:]
+    H = float(np.max(base_window))
+    L = float(np.min(base_window))
+
+    last = float(series[-1])
+    atrp = atr_proxy_from_prices(series, atr_lookback)
+
+    # 触发：最近 confirm_k 个点都站上/站下（带 buffer）
+    long_ok = all(x > (H + buffer) for x in recent)
+    short_ok = all(x < (L - buffer) for x in recent)
+
+    if not (long_ok or short_ok):
+        return None, None, None, None, None, "未触发突破确认"
+
+    direction = "LONG" if long_ok else "SHORT"
+    entry = last
+
+    # 止损（两种思路融合：以突破位为主，ATR代理做保护）
+    if direction == "LONG":
+        stop1 = H  # 跌回区间上沿，突破失败
+        stop2 = (H - atr_mult_stop * atrp) if np.isfinite(atrp) else stop1
+        stop = min(stop1, stop2)  # 多单止损取更宽一点（更低）
+        R = entry - stop
+        tp = entry + rr_take * R if R > 0 else float("nan")
+        level = H
+        info = f"突破上沿 H={H:.0f}，连续{confirm_k}次确认站上（buffer={buffer:g}）"
+    else:
+        stop1 = L  # 反弹回区间下沿，突破失败
+        stop2 = (L + atr_mult_stop * atrp) if np.isfinite(atrp) else stop1
+        stop = max(stop1, stop2)  # 空单止损取更宽一点（更高）
+        R = stop - entry
+        tp = entry - rr_take * R if R > 0 else float("nan")
+        level = L
+        info = f"跌破下沿 L={L:.0f}，连续{confirm_k}次确认站下（buffer={buffer:g}）"
+
+    return direction, entry, stop, tp, level, info
 
 
 # ---------------------------
@@ -160,37 +200,48 @@ with st.sidebar:
     only_trade_time = st.checkbox("仅在交易时段请求行情（推荐）", value=True)
     pause_fetch = st.checkbox("暂停抓取（我现在不盯盘）", value=False)
 
-    z_win = st.slider("Z-score 窗口（样本点）", 60, 600, 180, step=30)
-    z_th = st.slider("告警阈值 |Z| ≥", 1.0, 3.0, 2.0, step=0.1)
+    st.divider()
+    st.subheader("突破确认信号（模板1）")
+    signal_symbol = st.selectbox("信号品种", ["Y", "P", "OI", "M"], index=0)
+    win = st.slider("区间窗口N（样本点）", 30, 600, 180, step=30)
+    confirm_k = st.slider("确认次数K", 2, 8, 3)
+    buffer = st.number_input("突破缓冲（点）", value=1.0, min_value=0.0, step=1.0)
+    atr_lb = st.slider("波动代理窗口（样本点）", 20, 300, 60, step=20)
+    atr_mult_stop = st.number_input("止损ATR倍数（代理）", value=0.5, min_value=0.0, step=0.1)
+    rr_take = st.number_input("止盈R倍（TP = entry ± R*倍数）", value=2.0, min_value=0.5, step=0.5)
+    cooldown_sec = st.slider("同向信号冷却（秒）", 30, 600, 120, step=30)
+
+    st.divider()
+    z_win = st.slider("价差Z-score 窗口（样本点）", 60, 600, 180, step=30)
+    z_th = st.slider("价差告警阈值 |Z| ≥", 1.0, 3.0, 2.0, step=0.1)
     show_debug = st.checkbox("显示调试信息（可选）", value=False)
 
 symbols_map = CONTRACT_GROUPS[group]
 symbols = tuple(symbols_map.values())
 
-# session_state：保存价差历史，用于 z-score
-if "hist" not in st.session_state:
-    st.session_state.hist = {
+# state：价差历史 + 单品种价格历史 + 信号冷却
+if "hist_spread" not in st.session_state:
+    st.session_state.hist_spread = {
         "Y-P": deque(maxlen=2000),
         "OI-Y": deque(maxlen=2000),
         "OI-P": deque(maxlen=2000),
     }
-if "last_alert" not in st.session_state:
-    st.session_state.last_alert = {}
+if "price_hist" not in st.session_state:
+    st.session_state.price_hist = {sym: deque(maxlen=5000) for sym in symbols}
+if "last_signal_ts" not in st.session_state:
+    st.session_state.last_signal_ts = {}  # key: (group, sym, dir) -> ts
 
-# 判断当前是否交易时段（用 CST）
+# 交易时段
 now_cst = datetime.now(TZ_CST)
 trading_now = is_trading_time_cst(now_cst)
-
-# 决定刷新间隔
 refresh_sec = refresh_trading if trading_now else refresh_off
 
-# 自动刷新
 st_autorefresh(interval=refresh_sec * 1000, key="tick")
 
 now_jst = datetime.now(TZ_JST).strftime("%Y-%m-%d %H:%M:%S JST")
 now_cst_str = now_cst.strftime("%Y-%m-%d %H:%M:%S CST")
 status = "🟢 交易时段" if trading_now else "⚪️ 非交易时段"
-st.caption(f"更新时间：{now_jst}（{now_cst_str}）｜{status}｜当前刷新：{refresh_sec}s｜合约组：{group}")
+st.caption(f"更新时间：{now_jst}（{now_cst_str}）｜{status}｜刷新：{refresh_sec}s｜合约组：{group}")
 
 # 是否请求行情
 should_fetch = True
@@ -200,21 +251,17 @@ elif only_trade_time and (not trading_now):
     should_fetch = False
 
 raw = {}
-fetch_note = ""
 if should_fetch:
     try:
-        # 缓存 + 限频：ttl=5 秒（你可以按需改大，比如 8~10）
         raw = fetch_sina_quotes_cached(symbols)
-        fetch_note = "已请求新浪行情（带缓存限频）"
+        st.caption("已请求新浪行情（带缓存限频）")
     except Exception as e:
         st.error(f"拉取行情失败：{e}")
         st.stop()
 else:
-    fetch_note = "当前未请求行情（暂停或非交易时段）"
+    st.caption("当前未请求行情（暂停或非交易时段）")
 
-st.caption(fetch_note)
-
-# 解析
+# 解析 DataFrame
 rows = []
 for k, sym in symbols_map.items():
     fields = raw.get(sym)
@@ -250,7 +297,82 @@ st.divider()
 st.subheader("实时行情")
 st.dataframe(df, use_container_width=True, hide_index=True)
 
-# 计算价差（如果没行情则是 NaN）
+# 更新单品种价格历史（用于突破信号）
+for k, sym in symbols_map.items():
+    v = df[df["品种"] == k]["最新"].values[0]
+    if np.isfinite(v):
+        # 如果切换合约组后 symbols 变化，确保 key 存在
+        if sym not in st.session_state.price_hist:
+            st.session_state.price_hist[sym] = deque(maxlen=5000)
+        st.session_state.price_hist[sym].append(float(v))
+
+# ---------------------------
+# 突破信号区
+# ---------------------------
+st.subheader("单品种交易提示（突破确认模板）")
+
+target_sym = symbols_map[signal_symbol]
+prices = st.session_state.price_hist.get(target_sym, deque())
+
+direction, entry, stop, tp, level, info = breakout_signal(
+    prices=prices,
+    window=win,
+    confirm_k=confirm_k,
+    buffer=buffer,
+    atr_lookback=atr_lb,
+    atr_mult_stop=atr_mult_stop,
+    rr_take=rr_take,
+)
+
+def can_emit_signal(group_: str, sym_: str, dir_: str, cooldown: int) -> bool:
+    key = (group_, sym_, dir_)
+    last_ts = st.session_state.last_signal_ts.get(key, 0)
+    now_ts = time.time()
+    if now_ts - last_ts >= cooldown:
+        st.session_state.last_signal_ts[key] = now_ts
+        return True
+    return False
+
+left, mid, right = st.columns([1.2, 1.0, 1.2])
+with left:
+    st.write(f"**标的：** {signal_symbol} / {target_sym}")
+    st.write(f"**状态：** {info}")
+
+with mid:
+    st.write("**参考位**")
+    st.metric("突破参考位", "-" if level is None else f"{level:.0f}")
+
+with right:
+    st.write("**建议（仅提示，不构成投资建议）**")
+    if direction is None:
+        st.info("暂无触发信号")
+    else:
+        # 给出明确的“入场/止损/止盈”
+        if direction == "LONG":
+            action = "考虑做多"
+            emoji = "🚀"
+        else:
+            action = "考虑做空"
+            emoji = "📉"
+
+        # 冷却防刷屏：只在冷却窗口内第一次显示“强提示”，否则用普通提示
+        if can_emit_signal(group, target_sym, direction, cooldown_sec):
+            st.warning(
+                f"{emoji}【突破确认】{group} {target_sym}：{action}\n\n"
+                f"入场参考：{entry:.0f}\n"
+                f"止损参考：{stop:.0f}\n"
+                f"止盈参考：{tp:.0f}（{rr_take}R）"
+            )
+        else:
+            st.info(
+                f"信号仍然有效（冷却中）：{action}｜入场 {entry:.0f}｜止损 {stop:.0f}｜止盈 {tp:.0f}"
+            )
+
+st.caption("说明：本模块使用“区间突破 + 连续K次确认”。止损以“跌回突破位”为主，叠加“波动代理(类似ATR)”做保护；止盈按 R 倍给出。")
+
+# ---------------------------
+# 结构价差（你原来的）
+# ---------------------------
 def get_price(prod: str) -> float:
     v = df[df["品种"] == prod]["最新"].values[0]
     return float(v) if np.isfinite(v) else float("nan")
@@ -265,16 +387,15 @@ spreads = {
     "OI-P": OI - P if np.isfinite(OI) and np.isfinite(P) else float("nan"),
 }
 
-# 更新历史（只有在“有有效价差”时才追加）
 for name, val in spreads.items():
     if np.isfinite(val):
-        st.session_state.hist[name].append(val)
+        st.session_state.hist_spread[name].append(val)
 
 st.subheader("结构价差与提示")
 
 s1, s2, s3 = st.columns(3)
 for col, name in zip([s1, s2, s3], ["Y-P", "OI-Y", "OI-P"]):
-    series = list(st.session_state.hist[name])[-z_win:]
+    series = list(st.session_state.hist_spread[name])[-z_win:]
     z = zscore_from_list(series) if len(series) >= 20 else float("nan")
     val = spreads[name]
     with col:
@@ -284,16 +405,18 @@ for col, name in zip([s1, s2, s3], ["Y-P", "OI-Y", "OI-P"]):
             delta=None if not np.isfinite(z) else f"Z={z:.2f}",
         )
 
-# 告警：|Z| >= 阈值
 alerts = []
 for name in ["Y-P", "OI-Y", "OI-P"]:
-    series = list(st.session_state.hist[name])[-z_win:]
+    series = list(st.session_state.hist_spread[name])[-z_win:]
     z = zscore_from_list(series)
     if np.isfinite(z) and abs(z) >= z_th:
         direction = "偏高" if z > 0 else "偏低"
         alerts.append((name, z, direction, spreads[name]))
 
 # 去抖：同一告警 60 秒内不重复刷屏
+if "last_alert" not in st.session_state:
+    st.session_state.last_alert = {}
+
 def should_alert(key: str, cooldown_sec: int = 60) -> bool:
     last_ts = st.session_state.last_alert.get(key, 0)
     if time.time() - last_ts >= cooldown_sec:
@@ -311,5 +434,5 @@ else:
 
 if show_debug:
     st.write("trading_now(CST):", trading_now)
-    st.write("symbols:", symbols)
-    st.write("raw keys:", list(raw.keys()))
+    st.write("signal target:", target_sym)
+    st.write("price_hist_len:", len(prices))
