@@ -1,12 +1,12 @@
-import time
 import math
+import time
 import requests
 import pandas as pd
 import streamlit as st
 from datetime import datetime, time as dtime
 
 # =========================
-# 页面设置
+# 页面配置
 # =========================
 st.set_page_config(
     page_title="期货实时提示看板",
@@ -16,7 +16,7 @@ st.set_page_config(
 st.title("📊 期货实时提示看板（2605 / 2609）")
 
 # =========================
-# 合约配置（⚠️ 新浪期货必须 nf_ + 小写）
+# 合约配置（新浪期货必须 nf_ + 小写）
 # =========================
 CONTRACT_GROUPS = {
     "2605": {
@@ -30,14 +30,14 @@ CONTRACT_GROUPS = {
         "P": "nf_p2609",
         "OI": "nf_oi2609",
         "M": "nf_m2609",
-    }
+    },
 }
 
 # =========================
 # 工具函数
 # =========================
-def is_trading_time():
-    """国内商品期货常规交易时间（不含夜盘细分）"""
+def is_trading_time() -> bool:
+    """国内商品期货常规交易时间（含夜盘）"""
     now = datetime.now().time()
     sessions = [
         (dtime(9, 0), dtime(11, 30)),
@@ -49,11 +49,12 @@ def is_trading_time():
 
 
 def fetch_sina_quotes(codes: list[str]) -> dict:
-    """从新浪获取行情"""
+    """获取新浪期货行情"""
     url = "https://hq.sinajs.cn/list=" + ",".join(codes)
     headers = {"Referer": "https://finance.sina.com.cn"}
     r = requests.get(url, headers=headers, timeout=5)
     r.encoding = "gbk"
+
     data = {}
     for line in r.text.splitlines():
         if "=" not in line:
@@ -65,29 +66,22 @@ def fetch_sina_quotes(codes: list[str]) -> dict:
     return data
 
 
-def parse_common(fields: list[str]) -> dict:
-    """通用期货字段解析（兼容 nf_）"""
+def parse_nf_fields(fields: list[str]) -> dict:
+    """解析 nf_ 期货字段"""
 
     def fnum(x):
         try:
             return float(x)
         except Exception:
-            return float("nan")
-
-    name = fields[0] if len(fields) > 0 else ""
-    open_ = fnum(fields[1]) if len(fields) > 1 else math.nan
-    last = fnum(fields[3]) if len(fields) > 3 else math.nan
-    high = fnum(fields[4]) if len(fields) > 4 else math.nan
-    low = fnum(fields[5]) if len(fields) > 5 else math.nan
+            return math.nan
 
     return {
-        "name": name,
-        "open": open_,
-        "last": last,
-        "high": high,
-        "low": low,
+        "name": fields[0] if len(fields) > 0 else "",
+        "open": fnum(fields[1]) if len(fields) > 1 else math.nan,
+        "last": fnum(fields[3]) if len(fields) > 3 else math.nan,
+        "high": fnum(fields[4]) if len(fields) > 4 else math.nan,
+        "low": fnum(fields[5]) if len(fields) > 5 else math.nan,
     }
-
 
 # =========================
 # Sidebar 参数
@@ -110,26 +104,30 @@ with st.sidebar:
     confirm_k = st.slider("确认次数 K", 2, 5, 3)
 
 # =========================
-# 行情获取
+# 交易时段控制
 # =========================
-codes = list(CONTRACT_GROUPS[contract_group].values())
-symbol_map = {v.split("_")[-1]: k for k, v in CONTRACT_GROUPS[contract_group].items()}
-
 now = datetime.now()
 trade_flag = is_trading_time()
 
 if only_trade and not trade_flag:
     st.info("⏸ 当前非交易时段，暂停行情请求")
-    time.sleep(refresh_idle)
     st.stop()
+
+# =========================
+# 行情获取
+# =========================
+codes = list(CONTRACT_GROUPS[contract_group].values())
+symbol_map = {v.split("_")[-1]: k for k, v in CONTRACT_GROUPS[contract_group].items()}
 
 raw = fetch_sina_quotes(codes)
 
 rows = []
 for raw_code, raw_text in raw.items():
+    label = symbol_map.get(raw_code, raw_code)
+
     if not raw_text:
         rows.append({
-            "品种": symbol_map.get(raw_code.upper(), raw_code),
+            "品种": label,
             "合约": raw_code.upper(),
             "最新": None,
             "今开": None,
@@ -139,10 +137,10 @@ for raw_code, raw_text in raw.items():
         continue
 
     fields = raw_text.split(",")
-    parsed = parse_common(fields)
+    parsed = parse_nf_fields(fields)
 
     rows.append({
-        "品种": symbol_map.get(raw_code.upper(), raw_code),
+        "品种": label,
         "合约": raw_code.upper(),
         "最新": parsed["last"],
         "今开": parsed["open"],
@@ -153,7 +151,7 @@ for raw_code, raw_text in raw.items():
 df = pd.DataFrame(rows)
 
 # =========================
-# 顶部状态
+# 页面状态
 # =========================
 st.caption(
     f"更新时间：{now:%Y-%m-%d %H:%M:%S} ｜ "
@@ -162,21 +160,22 @@ st.caption(
 )
 
 # =========================
-# 实时行情表
+# 行情表
 # =========================
 st.subheader("实时行情")
 st.dataframe(df, width="stretch", hide_index=True)
 
 # =========================
-# 突破确认信号（模板1）
+# 突破确认模板（模板1）
 # =========================
 st.subheader("单品种交易提示（突破确认模板）")
 
-target_row = df[df["品种"] == signal_symbol]
-if target_row.empty or pd.isna(target_row.iloc[0]["最新"]):
+target = df[df["品种"] == signal_symbol]
+
+if target.empty or pd.isna(target.iloc[0]["最新"]):
     st.warning("暂无有效行情数据")
 else:
-    price = float(target_row.iloc[0]["最新"])
+    price = float(target.iloc[0]["最新"])
 
     hist_key = f"hist_{signal_symbol}_{contract_group}"
     history = st.session_state.get(hist_key, [])
@@ -185,28 +184,31 @@ else:
     st.session_state[hist_key] = history
 
     if len(history) < lookback_n:
-        st.info("样本不足（开盘后需要积累一段数据）")
+        st.info("样本不足（需要积累一段数据）")
     else:
         high_n = max(history[:-1])
-        above = sum(1 for p in history[-confirm_k:] if p > high_n)
+        confirm = all(p > high_n for p in history[-confirm_k:])
 
-        if above == confirm_k:
+        if confirm:
             stop = high_n
             risk = price - stop
-            target = price + 2 * risk if risk > 0 else None
+            target_price = price + 2 * risk if risk > 0 else None
 
             st.success(
                 f"🚀 突破确认 · 做多\n\n"
-                f"标的：{signal_symbol}{contract_group}\n\n"
+                f"标的：{signal_symbol}{contract_group}\n"
                 f"入场参考：{price:.2f}\n"
                 f"止损：{stop:.2f}\n"
-                f"目标：{target:.2f}" if target else "目标待确认"
+                f"目标：{target_price:.2f}" if target_price else "目标待确认"
             )
         else:
             st.info("暂未触发突破确认信号")
 
 # =========================
-# 自动刷新
+# 自动刷新（Cloud 稳定方式）
 # =========================
-time.sleep(refresh_trade if trade_flag else refresh_idle)
-st.experimental_rerun()
+refresh_sec = refresh_trade if trade_flag else refresh_idle
+st.caption(f"⏱ 页面将于 {refresh_sec} 秒后自动刷新")
+st.experimental_set_query_params(t=str(int(time.time())))
+time.sleep(refresh_sec)
+st.rerun()
