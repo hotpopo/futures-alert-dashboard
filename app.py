@@ -7,6 +7,7 @@ import requests
 import numpy as np
 import pandas as pd
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 
 
 # ---------------------------
@@ -57,7 +58,7 @@ def fetch_sina_quotes(symbols: list[str]) -> dict:
 
 def parse_common(fields: list[str]) -> dict:
     """
-    字段在不同品种/版本可能略有差异。我们这里做“稳健解析”：
+    字段在不同品种/版本可能略有差异。这里做“稳健解析”：
     - name: fields[0]
     - open/high/low/last: 尽量从常见位置取，取不到就 NaN
     - volume/oi: 取不到就 NaN
@@ -65,7 +66,7 @@ def parse_common(fields: list[str]) -> dict:
     def fnum(x):
         try:
             return float(x)
-        except:
+        except Exception:
             return float("nan")
 
     name = fields[0] if len(fields) > 0 else ""
@@ -76,27 +77,21 @@ def parse_common(fields: list[str]) -> dict:
     low = fnum(fields[4]) if len(fields) > 4 else float("nan")
     last = fnum(fields[5]) if len(fields) > 5 else float("nan")
 
-    # 成交量、持仓量常见在 12/13 或 13/14 一带，存在差异，做兜底：
+    # volume / oi 的位置不完全一致：做兜底扫描
     volume = float("nan")
     oi = float("nan")
     for idx in [12, 13, 14, 15]:
-        if len(fields) > idx and volume != volume:  # NaN check
-            v = fnum(fields[idx])
-            # 成交量通常很大且为整数；这里不强校验，能转就收
-            volume = v
-        if len(fields) > idx + 1 and oi != oi:
-            o = fnum(fields[idx + 1])
-            oi = o
+        if len(fields) > idx and (volume != volume):  # NaN check
+            volume = fnum(fields[idx])
+        if len(fields) > idx + 1 and (oi != oi):
+            oi = fnum(fields[idx + 1])
 
-    # 日期/时间（末尾常有 date 或 date,time）
+    # 日期/时间（末尾常见：YYYY-MM-DD, HH:MM:SS）
     dt_text = ""
     if len(fields) >= 2:
-        # 有些是 ... , 2025-01-06, 14:01:02
         tail = fields[-2:]
         if re.match(r"\d{4}-\d{2}-\d{2}", tail[0]):
             dt_text = " ".join(tail)
-        elif re.match(r"\d{4}-\d{2}-\d{2}", fields[-1]):
-            dt_text = fields[-1]
 
     return {
         "name": name,
@@ -110,8 +105,8 @@ def parse_common(fields: list[str]) -> dict:
     }
 
 
-def zscore(series: list[float]) -> float:
-    arr = np.array(series, dtype=float)
+def zscore_from_list(values: list[float]) -> float:
+    arr = np.array(values, dtype=float)
     arr = arr[np.isfinite(arr)]
     if len(arr) < 20:
         return float("nan")
@@ -148,13 +143,13 @@ if "hist" not in st.session_state:
 if "last_alert" not in st.session_state:
     st.session_state.last_alert = {}
 
-# 自动刷新（不写死循环，避免云端卡死）
-st.autorefresh(interval=refresh_sec * 1000, key="tick")
+# 自动刷新（用 streamlit-autorefresh）
+st_autorefresh(interval=refresh_sec * 1000, key="tick")
 
-# 拉行情
 now = datetime.now(TZ_JST).strftime("%Y-%m-%d %H:%M:%S JST")
 st.caption(f"更新时间：{now}｜合约组：{group}（{', '.join(symbols)}）")
 
+# 拉行情
 try:
     raw = fetch_sina_quotes(symbols)
 except Exception as e:
@@ -223,7 +218,7 @@ st.subheader("结构价差与提示")
 s1, s2, s3 = st.columns(3)
 for col, name in zip([s1, s2, s3], ["Y-P", "OI-Y", "OI-P"]):
     series = list(st.session_state.hist[name])[-z_win:]
-    z = zscore(series) if len(series) >= 20 else float("nan")
+    z = zscore_from_list(series) if len(series) >= 20 else float("nan")
     val = spreads[name]
     with col:
         st.metric(
@@ -236,7 +231,7 @@ for col, name in zip([s1, s2, s3], ["Y-P", "OI-Y", "OI-P"]):
 alerts = []
 for name in ["Y-P", "OI-Y", "OI-P"]:
     series = list(st.session_state.hist[name])[-z_win:]
-    z = zscore(series)
+    z = zscore_from_list(series)
     if np.isfinite(z) and abs(z) >= z_th:
         direction = "偏高" if z > 0 else "偏低"
         alerts.append((name, z, direction, spreads[name]))
