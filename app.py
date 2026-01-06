@@ -10,19 +10,17 @@ import pandas as pd
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
-
 # =========================
 # 基础配置
 # =========================
 st.set_page_config(page_title="期货实时提示看板", layout="wide")
 
-# 时区：显示用JST；交易时段判断用CST（中国时间，避免Cloud误判）
 TZ_JST = timezone(timedelta(hours=9))
 TZ_CST = timezone(timedelta(hours=8))
 
-SINA_QUOTE_URL = "https://hq.sinajs.cn/list="
+# ✅ 关键：用 http，更稳定（Cloud 下 https 经常空返回）
+SINA_QUOTE_URL = "http://hq.sinajs.cn/list="
 
-# ✅ 新浪期货：必须 nf_ + 小写
 CONTRACT_GROUPS = {
     "2605": {"Y": "nf_y2605", "P": "nf_p2605", "OI": "nf_oi2605", "M": "nf_m2605"},
     "2609": {"Y": "nf_y2609", "P": "nf_p2609", "OI": "nf_oi2609", "M": "nf_m2609"},
@@ -32,17 +30,15 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0",
     "Referer": "https://finance.sina.com.cn/",
     "Accept": "*/*",
+    "Connection": "keep-alive",
 }
 
-
 # =========================
-# 交易时段判断（按中国时间CST）
+# 交易时段判断（按CST）
 # =========================
 def is_trading_time_cst(dt_cst: datetime) -> bool:
-    # 周末不交易（这里不考虑法定节假日）
     if dt_cst.weekday() >= 5:
         return False
-
     hm = dt_cst.hour * 60 + dt_cst.minute
 
     def in_range(a, b):
@@ -50,48 +46,47 @@ def is_trading_time_cst(dt_cst: datetime) -> bool:
 
     day_1 = in_range(9 * 60, 11 * 60 + 30)
     day_2 = in_range(13 * 60 + 30, 15 * 60)
-
-    # 夜盘：豆油/棕榈油/菜油通常到23:00；豆粕有的可到23:00或更晚
-    # 为了稳妥，这里用 21:00-23:00（你需要可再扩）
     night = in_range(21 * 60, 23 * 60)
 
     return day_1 or day_2 or night
 
-
 # =========================
-# 新浪行情：抓取/解析
+# 新浪行情：抓取/解析（带调试）
 # =========================
-def fetch_sina_quotes(symbols: list[str]) -> dict:
+def fetch_sina_quotes(symbols: list[str]):
+    """
+    返回:
+      quotes: dict[symbol]->fields(list)
+      debug: dict 里面有 status_code / text_head / url
+    """
     if not symbols:
-        return {}
+        return {}, {"status_code": None, "text_head": "", "url": ""}
+
     url = SINA_QUOTE_URL + ",".join(symbols)
-    r = requests.get(url, headers=HEADERS, timeout=8)
-    r.encoding = "gbk"
-    text = r.text
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=8, allow_redirects=True)
+        r.encoding = "gbk"
+        text = r.text
+        status = r.status_code
+    except Exception as e:
+        return {}, {"status_code": "EXC", "text_head": str(e)[:300], "url": url}
 
     out = {}
-    # 支持 nf_xxx / 任意code
     for m in re.finditer(r'var\s+hq_str_(\w+)\s*=\s*"([^"]*)";', text):
-        sym = m.group(1)                 # 例如 nf_y2605
+        sym = m.group(1)                 # nf_y2605
         payload = m.group(2).strip()     # 逗号分隔字段
-        if payload == "":
-            out[sym] = []
-        else:
-            out[sym] = payload.split(",")
-    return out
+        out[sym] = payload.split(",") if payload else []
 
-
-@st.cache_data(ttl=5, show_spinner=False)
-def fetch_sina_quotes_cached(symbols: tuple[str, ...]) -> dict:
-    return fetch_sina_quotes(list(symbols))
+    debug = {
+        "status_code": status,
+        "url": url,
+        "text_head": text[:300].replace("\n", "\\n"),
+        "matched_symbols": list(out.keys())[:10],
+    }
+    return out, debug
 
 
 def parse_nf(fields: list[str]) -> dict:
-    """
-    nf_ 期货字段在不同品种可能略有差异。
-    我们做“尽量稳”的解析：优先常见顺序：
-      name, open, prev_close, last, high, low, ...
-    """
     def fnum(x):
         try:
             return float(x)
@@ -99,29 +94,23 @@ def parse_nf(fields: list[str]) -> dict:
             return float("nan")
 
     name = fields[0] if len(fields) > 0 else ""
+    open_ = fnum(fields[1]) if len(fields) > 1 else math.nan
+    last  = fnum(fields[3]) if len(fields) > 3 else math.nan
+    high  = fnum(fields[4]) if len(fields) > 4 else math.nan
+    low   = fnum(fields[5]) if len(fields) > 5 else math.nan
 
-    # 常见字段位
-    open_ = fnum(fields[1]) if len(fields) > 1 else float("nan")
-    last  = fnum(fields[3]) if len(fields) > 3 else float("nan")
-    high  = fnum(fields[4]) if len(fields) > 4 else float("nan")
-    low   = fnum(fields[5]) if len(fields) > 5 else float("nan")
-
-    # 兜底：如果 last 解析不到，但 fields[2]/[1]能用，就尝试换位
     if not np.isfinite(last):
-        cand = []
         for idx in [2, 1, 6, 7]:
             if len(fields) > idx:
                 v = fnum(fields[idx])
                 if np.isfinite(v):
-                    cand.append(v)
-        if cand:
-            last = cand[0]
+                    last = v
+                    break
 
     return {"name": name, "open": open_, "high": high, "low": low, "last": last}
 
-
 # =========================
-# 统计：Z-score / ATR代理 / 突破确认（模板1）
+# 统计：Z-score / ATR代理 / 突破确认
 # =========================
 def zscore_from_list(values: list[float]) -> float:
     arr = np.array(values, dtype=float)
@@ -136,40 +125,22 @@ def zscore_from_list(values: list[float]) -> float:
 
 
 def atr_proxy_from_prices(prices: list[float], lookback: int) -> float:
-    """没有OHLC，用 |ΔP| 均值近似波动（保守替代）"""
     arr = np.array(prices, dtype=float)
     arr = arr[np.isfinite(arr)]
     if len(arr) < lookback + 2:
         return float("nan")
     diffs = np.abs(np.diff(arr[-(lookback + 1):]))
-    if len(diffs) == 0:
-        return float("nan")
-    return float(np.mean(diffs))
+    return float(np.mean(diffs)) if len(diffs) else float("nan")
 
 
-def breakout_signal(
-    prices: deque,
-    window: int,
-    confirm_k: int,
-    buffer: float,
-    atr_lookback: int,
-    atr_mult_stop: float,
-    rr_take: float,
-):
-    """
-    模板1：区间突破 + K次确认
-    返回：direction("LONG"/"SHORT"/None), entry, stop, tp, level, info
-    """
+def breakout_signal(prices: deque, window: int, confirm_k: int, buffer: float,
+                   atr_lookback: int, atr_mult_stop: float, rr_take: float):
     series = [p for p in list(prices) if np.isfinite(p)]
     if len(series) < window + confirm_k + 5:
         return None, None, None, None, None, "样本不足（开盘后需要积累一段数据）"
 
-    base = series[: -(confirm_k)]
+    base = series[: -confirm_k]
     recent = series[-confirm_k:]
-
-    if len(base) < window:
-        return None, None, None, None, None, "样本不足（base不足）"
-
     base_window = base[-window:]
     H = float(np.max(base_window))
     L = float(np.min(base_window))
@@ -192,19 +163,14 @@ def breakout_signal(
         stop = min(stop1, stop2)
         R = entry - stop
         tp = entry + rr_take * R if R > 0 else float("nan")
-        level = H
-        info = f"突破上沿 H={H:.0f}，连续{confirm_k}次确认站上（buffer={buffer:g}）"
+        return direction, entry, stop, tp, H, f"突破上沿H={H:.0f}，连续{confirm_k}次确认"
     else:
         stop1 = L
         stop2 = (L + atr_mult_stop * atrp) if np.isfinite(atrp) else stop1
         stop = max(stop1, stop2)
         R = stop - entry
         tp = entry - rr_take * R if R > 0 else float("nan")
-        level = L
-        info = f"跌破下沿 L={L:.0f}，连续{confirm_k}次确认站下（buffer={buffer:g}）"
-
-    return direction, entry, stop, tp, level, info
-
+        return direction, entry, stop, tp, L, f"跌破下沿L={L:.0f}，连续{confirm_k}次确认"
 
 # =========================
 # UI
@@ -213,7 +179,6 @@ st.title("📊 期货实时提示看板（2605 / 2609）")
 
 with st.sidebar:
     st.header("参数")
-
     group = st.selectbox("合约组", ["2605", "2609"], index=0)
 
     refresh_trading = st.slider("交易时段刷新间隔（秒）", 1, 10, 2)
@@ -241,13 +206,10 @@ with st.sidebar:
     st.divider()
     show_debug = st.checkbox("显示调试信息（可选）", value=False)
 
+symbols_map = CONTRACT_GROUPS[group]
+symbols = list(symbols_map.values())
 
-symbols_map = CONTRACT_GROUPS[group]  # {"Y": "nf_y2605", ...}
-symbols = tuple(symbols_map.values())
-
-# =========================
-# Session State：历史数据
-# =========================
+# Session state
 if "hist_spread" not in st.session_state:
     st.session_state.hist_spread = {
         "Y-P": deque(maxlen=5000),
@@ -261,26 +223,19 @@ if "last_signal_ts" not in st.session_state:
 if "last_alert_ts" not in st.session_state:
     st.session_state.last_alert_ts = {}
 
-# =========================
 # 时段与刷新
-# =========================
 now_cst = datetime.now(TZ_CST)
 trading_now = is_trading_time_cst(now_cst)
-
 refresh_sec = refresh_trading if trading_now else refresh_off
 st_autorefresh(interval=refresh_sec * 1000, key="tick")
 
-now_jst_str = datetime.now(TZ_JST).strftime("%Y-%m-%d %H:%M:%S JST")
-now_cst_str = now_cst.strftime("%Y-%m-%d %H:%M:%S CST")
-status = "🟢 交易时段" if trading_now else "⚪️ 非交易时段"
-
+now_jst = datetime.now(TZ_JST)
 st.caption(
-    f"更新时间：{now_jst_str}（{now_cst_str}）｜{status}｜刷新：{refresh_sec}s｜合约组：{group}"
+    f"更新时间：{now_jst:%Y-%m-%d %H:%M:%S JST}（{now_cst:%Y-%m-%d %H:%M:%S CST}）｜"
+    f"{'🟢 交易时段' if trading_now else '⚪ 非交易时段'}｜刷新：{refresh_sec}s｜合约组：{group}"
 )
 
-# =========================
 # 是否请求行情
-# =========================
 should_fetch = True
 if pause_fetch:
     should_fetch = False
@@ -288,23 +243,26 @@ elif only_trade_time and (not trading_now):
     should_fetch = False
 
 raw = {}
+debug = {"status_code": None, "text_head": "", "url": "", "matched_symbols": []}
+
 if should_fetch:
-    try:
-        raw = fetch_sina_quotes_cached(symbols)
-        st.caption("已请求新浪期货行情（带缓存限频）")
-    except Exception as e:
-        st.error(f"拉取行情失败：{e}")
-        st.stop()
+    raw, debug = fetch_sina_quotes(symbols)
+    st.caption("已请求新浪期货行情（若仍无数据，请看调试区的 status_code 与 text_head）")
 else:
     st.info("当前非交易时段/暂停抓取，已停止行情请求")
 
+# ✅ 调试信息前置：你勾选后马上能看到
+if show_debug:
+    st.info(
+        f"DEBUG｜status_code={debug.get('status_code')} ｜ matched={debug.get('matched_symbols')} \n\n"
+        f"URL：{debug.get('url')}\n\n"
+        f"text_head：{debug.get('text_head')}"
+    )
 
-# =========================
-# 解析 DataFrame（实时行情）
-# =========================
+# 解析 DataFrame
 rows = []
 for prod, sym in symbols_map.items():
-    fields = raw.get(sym, None)  # sym 例如 nf_y2605
+    fields = raw.get(sym, None)
     if not fields:
         rows.append({"品种": prod, "合约": sym.replace("nf_", "").upper(), "名称": "-", "最新": np.nan, "今开": np.nan, "最高": np.nan, "最低": np.nan})
         continue
@@ -337,31 +295,19 @@ st.divider()
 st.subheader("实时行情")
 st.dataframe(df, width="stretch", hide_index=True)
 
-# 更新单品种价格历史
+# 更新历史
 for prod, sym in symbols_map.items():
     v = df[df["品种"] == prod]["最新"].values[0]
     if np.isfinite(v):
-        if sym not in st.session_state.price_hist:
-            st.session_state.price_hist[sym] = deque(maxlen=8000)
-        st.session_state.price_hist[sym].append(float(v))
+        st.session_state.price_hist.setdefault(sym, deque(maxlen=8000)).append(float(v))
 
-
-# =========================
-# 突破确认模板1
-# =========================
+# 突破确认模板
 st.subheader("单品种交易提示（突破确认模板）")
-
-target_sym = symbols_map[signal_symbol]      # nf_y2605
+target_sym = symbols_map[signal_symbol]
 prices = st.session_state.price_hist.get(target_sym, deque())
 
 direction, entry, stop, tp, level, info = breakout_signal(
-    prices=prices,
-    window=win,
-    confirm_k=confirm_k,
-    buffer=buffer,
-    atr_lookback=atr_lb,
-    atr_mult_stop=atr_mult_stop,
-    rr_take=rr_take,
+    prices, win, confirm_k, buffer, atr_lb, atr_mult_stop, rr_take
 )
 
 def can_emit_signal(group_: str, sym_: str, dir_: str, cooldown: int) -> bool:
@@ -388,14 +334,8 @@ with right:
     if direction is None:
         st.info("暂无触发信号")
     else:
-        if direction == "LONG":
-            action = "考虑做多"
-            emoji = "🚀"
-        else:
-            action = "考虑做空"
-            emoji = "📉"
-
-        # 冷却防刷屏
+        action = "考虑做多" if direction == "LONG" else "考虑做空"
+        emoji = "🚀" if direction == "LONG" else "📉"
         if can_emit_signal(group, target_sym, direction, cooldown_sec):
             st.warning(
                 f"{emoji}【突破确认】{target_sym.replace('nf_', '').upper()}：{action}\n\n"
@@ -404,16 +344,11 @@ with right:
                 f"止盈参考：{tp:.0f}（{rr_take}R）"
             )
         else:
-            st.info(
-                f"信号仍有效（冷却中）：{action}｜入场 {entry:.0f}｜止损 {stop:.0f}｜止盈 {tp:.0f}"
-            )
+            st.info(f"信号仍有效（冷却中）：{action}｜入场 {entry:.0f}｜止损 {stop:.0f}｜止盈 {tp:.0f}")
 
 st.caption("说明：模板1=区间突破+连续K次确认。止损以“回到突破位”为主，叠加波动代理保护；止盈按R倍给出。")
 
-
-# =========================
-# 结构价差与Z-score
-# =========================
+# 结构价差与Z-score（略：保持原逻辑）
 def get_price(prod: str) -> float:
     v = df[df["品种"] == prod]["最新"].values[0]
     return float(v) if np.isfinite(v) else float("nan")
@@ -433,55 +368,11 @@ for name, val in spreads.items():
         st.session_state.hist_spread[name].append(val)
 
 st.subheader("结构价差与提示（Z-score）")
-
 s1, s2, s3 = st.columns(3)
 for col, name in zip([s1, s2, s3], ["Y-P", "OI-Y", "OI-P"]):
     series = list(st.session_state.hist_spread[name])[-z_win:]
     z = zscore_from_list(series) if len(series) >= 20 else float("nan")
     val = spreads[name]
     with col:
-        st.metric(
-            label=f"{name}",
-            value="-" if not np.isfinite(val) else f"{val:.0f}",
-            delta=None if not np.isfinite(z) else f"Z={z:.2f}",
-        )
-
-def should_alert(key: str, cooldown: int = 60) -> bool:
-    last_ts = st.session_state.last_alert_ts.get(key, 0.0)
-    now_ts = time.time()
-    if now_ts - last_ts >= cooldown:
-        st.session_state.last_alert_ts[key] = now_ts
-        return True
-    return False
-
-alerts = []
-for name in ["Y-P", "OI-Y", "OI-P"]:
-    series = list(st.session_state.hist_spread[name])[-z_win:]
-    z = zscore_from_list(series)
-    if np.isfinite(z) and abs(z) >= z_th:
-        direction_txt = "偏高" if z > 0 else "偏低"
-        alerts.append((name, z, direction_txt, spreads[name]))
-
-if alerts:
-    for name, z, direction_txt, val in alerts:
-        key = f"{group}-{name}-{direction_txt}"
-        if should_alert(key, cooldown=60):
-            st.warning(f"⚠️【价差极值提示】{group}  {name} {direction_txt}｜当前 {val:.0f}｜Z={z:.2f}")
-else:
-    st.success("✅ 当前无价差极值告警（可在左侧调整窗口与阈值）")
-
-
-# =========================
-# 调试信息（可选）
-# =========================
-if show_debug:
-    st.divider()
-    st.subheader("调试信息")
-    st.write("Cloud 判断交易时段（CST）：", trading_now)
-    st.write("should_fetch：", should_fetch)
-    st.write("symbols：", symbols)
-    # 输出一个品种的原始字段长度，便于定位解析问题
-    sample_sym = symbols_map["Y"]
-    st.write("样例 raw key：", sample_sym)
-    st.write("样例 fields len：", len(raw.get(sample_sym, [])))
-    st.write("price_hist_len：", len(st.session_state.price_hist.get(sample_sym, [])))
+        st.metric(label=f"{name}", value="-" if not np.isfinite(val) else f"{val:.0f}",
+                  delta=None if not np.isfinite(z) else f"Z={z:.2f}")
